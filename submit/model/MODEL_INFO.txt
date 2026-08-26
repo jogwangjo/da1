@@ -1,0 +1,16 @@
+DF-Arena 1B
+- Source: Speech-Arena-2025/DF_Arena_1B_V_1
+- Revision: fb6ce85de12c2c5a509d89114adaf827dd75f49f
+- Local directory: df_arena_1b
+
+HTDemucs
+- Model: htdemucs (955717e8-8726e21a)
+- Local directory: htdemucs
+
+PANNs Cnn14
+- Checkpoint: Cnn14_mAP=0.431.pth
+- Local directory: panns
+=== Ãß°¡ ¸ðµ¨ (¾Ó»óºí ¹öÀü) ===
+w2v2-aasist.onnx : SpeechAntiSpoofingBenchmarks/W2V2-AASIST (Tak et al., ONNX)
+sonics-alpha-5s  : awsaf49/sonics-spectttra-alpha-5s (ICLR 2025 SONICS)
+sonics-beta-5s   : awsaf49/sonics-spectttra-beta-5s

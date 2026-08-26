@@ -1,0 +1,31 @@
+# Cache directories (large)
+_cache/
+_mini/
+zoo/
+open/
+
+# Training outputs
+runs/
+train_data/
+output/
+pseudo_eval/
+
+# Large files
+*.zip
+*.pth
+*.onnx
+*.mp4
+*.mov
+*.avi
+
+# IDE
+.vscode/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Colab temp
+.ipynb_checkpoints/

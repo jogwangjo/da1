@@ -1,0 +1,4 @@
+{
+  "feature_extractor_type": "AntispoofingFeatureExtractor",
+  "processor_class": "feature_extraction_antispoofing.AntispoofingFeatureExtractor"
+}

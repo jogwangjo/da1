@@ -1,0 +1,100 @@
+{
+  "audio": {
+    "max_len": 80000,
+    "max_time": 5,
+    "normalize": true,
+    "random_sampling": true,
+    "sample_rate": 16000,
+    "skip_time": false
+  },
+  "augment": {
+    "freq_mask_param": 8,
+    "mixup_alpha": 2.5,
+    "mixup_p": 0.5,
+    "n_freq_masks": 1,
+    "n_time_masks": 2,
+    "time_freq_mask_p": 0.5,
+    "time_mask_param": 8
+  },
+  "dataset": {
+    "test_dataframe": "test.csv",
+    "train_dataframe": "train.csv",
+    "valid_dataframe": "valid.csv"
+  },
+  "environment": {
+    "mixed_precision": true,
+    "num_workers": 8,
+    "seed": 42
+  },
+  "experiment_name": "spectttra_alpha-t=5",
+  "logger": {
+    "primary_metric": "f1",
+    "project": "sonics"
+  },
+  "loss": {
+    "label_smoothing": 0.02,
+    "name": "BCEWithLogitsLoss"
+  },
+  "melspec": {
+    "f_max": 8000,
+    "f_min": 20,
+    "hop_length": 512,
+    "n_fft": 2048,
+    "n_mels": 128,
+    "norm": "mean_std",
+    "power": 2,
+    "top_db": 80,
+    "win_length": 2048
+  },
+  "model": {
+    "attn_drop_rate": 0.1,
+    "embed_dim": 384,
+    "f_clip": 1,
+    "input_shape": [
+      128,
+      128
+    ],
+    "mlp_ratio": 2.67,
+    "name": "SpecTTTra",
+    "num_heads": 6,
+    "num_layers": 12,
+    "pe_learnable": true,
+    "pos_drop_rate": 0.1,
+    "pre_norm": true,
+    "proj_drop_rate": 0.0,
+    "resume": null,
+    "t_clip": 3,
+    "use_init_weights": false
+  },
+  "num_classes": 1,
+  "optimizer": {
+    "clip_grad_norm": 5.0,
+    "grad_accum_steps": 1,
+    "momentum": 0.9,
+    "opt": "adamw",
+    "opt_betas": [
+      0.9,
+      0.999
+    ],
+    "opt_eps": 1e-08,
+    "weight_decay": 0.05
+  },
+  "scheduler": {
+    "decay_rate": 0.1,
+    "lr": 0.0008,
+    "lr_base": 0.001,
+    "lr_base_scale": "linear",
+    "lr_base_size": 256,
+    "min_lr": 0.0,
+    "sched": "cosine",
+    "warmup_epochs": 5,
+    "warmup_lr": 1e-06
+  },
+  "training": {
+    "batch_size": 256,
+    "epochs": 50
+  },
+  "validation": {
+    "batch_size": 256
+  }
+}
