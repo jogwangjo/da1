@@ -137,6 +137,7 @@ def prepare_asvspoof_2019_la(asvspoof_dir, out_dir, max_per_class=5000):
 def prepare_codecfake(out_dir, max_samples=3000):
     """Codecfake HuggingFace에서 다운로드."""
     try:
+        out_dir.mkdir(parents=True, exist_ok=True)
         from datasets import load_dataset
         ds = load_dataset("rogertseng/CodecFake", split="train", streaming=True, revision="refs/convert/parquet")
         
@@ -154,7 +155,7 @@ def prepare_codecfake(out_dir, max_samples=3000):
                     audio_array = librosa.resample(
                         audio_array, orig_sr=audio["sampling_rate"], target_sr=SR
                     )
-                sf.write(str(wav_path), audio_array, SR)
+                sf.write(str(wav_path), np.clip(audio_array, -1, 1), SR)
             rows.append((str(wav_path), 1, "codecfake"))
         
         return rows
@@ -170,18 +171,21 @@ def prepare_sonics(out_dir, max_samples=5000):
     """SONICS HF에서 오디오 다운로드."""
     try:
         from datasets import load_dataset
-        # Try loading with streaming
         ds = load_dataset("awsaf49/sonics", split="train", streaming=True)
         
         out_dir.mkdir(parents=True, exist_ok=True)
         rows = []
         count = 0
+        
+        # First, check what columns exist
+        sample = next(iter(ds))
+        print(f"  SONICS columns: {list(sample.keys())}")
+        
+        # Reset and iterate
+        ds = load_dataset("awsaf49/sonics", split="train", streaming=True)
         for i, sample in enumerate(ds):
             if count >= max_samples:
                 break
-            # Filter for fake songs only
-            if sample.get("label", 0) != 1 and "fake" not in str(sample.get("label", "")).lower():
-                continue
             try:
                 audio = sample["audio"]
                 wav_path = out_dir / f"sonics_fake_{count:06d}.wav"

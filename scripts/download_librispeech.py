@@ -15,8 +15,8 @@ from datasets import load_dataset
 import soundfile as sf
 import numpy as np
 
-# datasets v4.0+ requires revision="refs/convert/parquet"
-ds = load_dataset("openslr/librispeech_asr", "clean", split="test", revision="refs/convert/parquet")
+# datasets v4.0+: config is 'default', not 'clean'
+ds = load_dataset("openslr/librispeech_asr", "default", split="test", revision="refs/convert/parquet")
 print(f"Loaded {len(ds)} samples")
 
 count = 0
