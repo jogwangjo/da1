@@ -138,7 +138,7 @@ def prepare_codecfake(out_dir, max_samples=3000):
     """Codecfake HuggingFace에서 다운로드."""
     try:
         from datasets import load_dataset
-        ds = load_dataset("FENRIR-Tool/Codecfake", split="train", streaming=True)
+        ds = load_dataset("rogertseng/CodecFake", split="train", streaming=True, revision="refs/convert/parquet")
         
         rows = []
         for i, sample in enumerate(ds):
@@ -167,31 +167,39 @@ def prepare_codecfake(out_dir, max_samples=3000):
 # 3. SONICS — 노래/음악 fake (Suno/Udio)
 # ============================================================
 def prepare_sonics(out_dir, max_samples=5000):
-    """SONICS HF에서 오디오 파일 다운로드."""
+    """SONICS HF에서 오디오 다운로드."""
     try:
-        from huggingface_hub import HfApi, hf_hub_download
-        import shutil as _sh
-        
-        api = HfApi()
-        repo = "awsaf49/sonics"
-        files = api.list_repo_files(repo, repo_type="dataset")
-        audio_files = sorted(
-            f for f in files 
-            if Path(f).suffix.lower() in {".wav", ".mp3", ".flac"}
-            and "fake" in f.lower()
-        )
+        from datasets import load_dataset
+        # Try loading with streaming
+        ds = load_dataset("awsaf49/sonics", split="train", streaming=True)
         
         out_dir.mkdir(parents=True, exist_ok=True)
-        step = max(1, len(audio_files) // max_samples)
-        picked = audio_files[::step][:max_samples]
-        
         rows = []
-        for i, f in enumerate(picked):
-            local = hf_hub_download(repo, f, repo_type="dataset")
-            tgt = out_dir / f"sonics_fake_{i:06d}.wav"
-            if not tgt.exists():
-                _sh.copy(local, tgt)
-            rows.append((str(tgt), 1, "sonics"))
+        count = 0
+        for i, sample in enumerate(ds):
+            if count >= max_samples:
+                break
+            # Filter for fake songs only
+            if sample.get("label", 0) != 1 and "fake" not in str(sample.get("label", "")).lower():
+                continue
+            try:
+                audio = sample["audio"]
+                wav_path = out_dir / f"sonics_fake_{count:06d}.wav"
+                if not wav_path.exists():
+                    import soundfile as sf
+                    audio_array = np.array(audio["array"], dtype=np.float32)
+                    if audio["sampling_rate"] != SR:
+                        import librosa
+                        audio_array = librosa.resample(
+                            audio_array, orig_sr=audio["sampling_rate"], target_sr=SR
+                        )
+                    sf.write(str(wav_path), np.clip(audio_array, -1, 1), SR)
+                rows.append((str(wav_path), 1, "sonics"))
+                count += 1
+                if count % 500 == 0:
+                    print(f"  SONICS: {count} files...")
+            except Exception:
+                continue
         
         return rows
     except Exception as e:
