@@ -387,6 +387,11 @@ def main():
     write_manifest(all_rows, out / "manifest_all.csv")
     
     # 통합 manifest에서 train/val 분리 (source 단위 stratified)
+    if len(all_rows) == 0:
+        print("\nERROR: No training data found! Check your data sources.")
+        print("Required: LibriSpeech, ASVspoof, Codecfake, SONICS, etc.")
+        return
+    
     from sklearn.model_selection import train_test_split
     all_for_split = [[r[0], r[1]] for r in all_rows]
     tr, va = train_test_split(all_for_split, test_size=0.15, random_state=42,
