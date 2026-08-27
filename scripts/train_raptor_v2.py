@@ -258,7 +258,6 @@ class XLSRBackbone(nn.Module):
         from transformers import Wav2Vec2Model
         self.backbone = Wav2Vec2Model.from_pretrained(name)
         self.backbone.eval()
-        # Freeze all parameters
         for param in self.backbone.parameters():
             param.requires_grad = False
         self.dim = self.backbone.config.hidden_size
@@ -269,6 +268,68 @@ class XLSRBackbone(nn.Module):
         self.backbone.eval()
         outputs = self.backbone(wav, output_hidden_states=True)
         return outputs.hidden_states
+
+
+class WavLMBackbone(nn.Module):
+    """WavLM-Large backbone (frozen) — 3rd SSL perspective."""
+    def __init__(self, name="microsoft/wavlm-large"):
+        super().__init__()
+        from transformers import WavLMModel
+        self.backbone = WavLMModel.from_pretrained(name)
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        self.dim = self.backbone.config.hidden_size
+        self.n_layers = self.backbone.config.num_hidden_layers
+
+    @torch.no_grad()
+    def forward(self, wav):
+        self.backbone.eval()
+        outputs = self.backbone(wav, output_hidden_states=True)
+        return outputs.hidden_states
+
+
+class SpectrogramCNN(nn.Module):
+    """CNN on log-mel spectrogram — different feature perspective."""
+    def __init__(self, n_mels=128, n_classes=1):
+        super().__init__()
+        self.n_mels = n_mels
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, n_classes),
+        )
+
+    def _wav_to_mel(self, wav):
+        """Convert raw waveform to log-mel spectrogram."""
+        import torchaudio
+        mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=16000, n_mels=self.n_mels,
+            n_fft=1024, hop_length=256, win_length=1024
+        )(wav)
+        log_mel = torch.log(mel + 1e-9)
+        return log_mel.unsqueeze(1)  # [B, 1, n_mels, T]
+
+    def forward(self, wav):
+        mel = self._wav_to_mel(wav)
+        feat = self.cnn(mel)
+        feat = feat.flatten(1)
+        return self.head(feat).squeeze(-1)  # [B]
 
 
 # ============================================================
@@ -361,12 +422,14 @@ class LayerWiseClassifier(nn.Module):
 # ============================================================
 
 class UltimateDetector(nn.Module):
-    """Dual-backbone with RAPTOR + Layer-Wise Decision Fusion.
+    """Triple-backbone + CNN with RAPTOR + Layer-Wise Decision Fusion.
 
-    Architecture:
+    Architecture (2026 SOTA):
     1. mHuBERT-Iter2 (trainable) → RAPTOR pairwise gated fusion
     2. XLS-R-300M (frozen) → Layer-wise decision fusion
-    3. Final: weighted combination of both
+    3. WavLM-Large (frozen) → Layer-wise decision fusion
+    4. Spectrogram CNN → log-mel features
+    5. Final: weighted combination of all 4
     """
     def __init__(self, dropout=0.1):
         super().__init__()
@@ -381,18 +444,27 @@ class UltimateDetector(nn.Module):
         dim2 = self.xlsr.dim
         n_layers2 = self.xlsr.n_layers
 
+        # Backbone 3: WavLM-Large (frozen)
+        self.wavlm = WavLMBackbone("microsoft/wavlm-large")
+        dim3 = self.wavlm.dim
+        n_layers3 = self.wavlm.n_layers
+
+        # Backbone 4: Spectrogram CNN
+        self.spec_cnn = SpectrogramCNN(n_mels=128)
+
         # RAPTOR fusion for mHuBERT
         n_pairs1 = n_layers1 // 2
         self.pair_gates = nn.ModuleList([PairwiseGate(dim1) for _ in range(n_pairs1)])
         self.hier_gate = HierarchicalGate(dim1)
         self.pool1 = AttentionPooling(dim1)
 
-        # Layer-wise classifier for XLS-R
-        self.lw_classifier = LayerWiseClassifier(dim2, n_layers2, d=128)
+        # Layer-wise classifiers for XLS-R and WavLM
+        self.lw_classifier_xlsr = LayerWiseClassifier(dim2, n_layers2, d=128)
+        self.lw_classifier_wavlm = LayerWiseClassifier(dim3, n_layers3, d=128)
 
-        # Cross-backbone fusion
+        # Cross-backbone fusion (all 4)
         self.cross_fusion = nn.Sequential(
-            nn.Linear(dim1 + 128, 256),
+            nn.Linear(dim1 + 128 + 128 + 64, 256),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(256, 64),
@@ -401,7 +473,7 @@ class UltimateDetector(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Individual heads for each backbone
+        # Individual heads
         self.head_mhubert = nn.Sequential(
             nn.LayerNorm(dim1),
             nn.Linear(dim1, 256),
@@ -410,12 +482,14 @@ class UltimateDetector(nn.Module):
             nn.Linear(256, 1),
         )
 
-        # Learnable backbone weights
-        self.alpha_mhubert = nn.Parameter(torch.tensor(0.5))
-        self.alpha_xlsr = nn.Parameter(torch.tensor(0.5))
+        # Learnable backbone weights (4 backbones)
+        self.alpha_mhubert = nn.Parameter(torch.tensor(0.3))
+        self.alpha_xlsr = nn.Parameter(torch.tensor(0.25))
+        self.alpha_wavlm = nn.Parameter(torch.tensor(0.25))
+        self.alpha_spec = nn.Parameter(torch.tensor(0.2))
 
     def forward(self, wav):
-        # Backbone 1: mHuBERT
+        # Backbone 1: mHuBERT (trainable)
         hs1 = self.mhubert(wav)
         pairs = []
         for i in range(0, len(hs1) - 1, 2):
@@ -426,29 +500,46 @@ class UltimateDetector(nn.Module):
             pairs.append(hs1[-1])
         fused1 = self.hier_gate(pairs)
         pooled1 = self.pool1(fused1)  # [B, dim1]
+        mhubert_score = self.head_mhubert(pooled1).squeeze(-1)  # [B]
 
         # Backbone 2: XLS-R (frozen)
         with torch.no_grad():
             hs2 = self.xlsr(wav)
-        xlsr_score = self.lw_classifier(hs2)  # [B]
+        xlsr_score = self.lw_classifier_xlsr(hs2)  # [B]
 
-        # Individual mHuBERT score
-        mhubert_score = self.head_mhubert(pooled1).squeeze(-1)  # [B]
+        # Backbone 3: WavLM (frozen)
+        with torch.no_grad():
+            hs3 = self.wavlm(wav)
+        wavlm_score = self.lw_classifier_wavlm(hs3)  # [B]
+
+        # Backbone 4: Spectrogram CNN
+        spec_score = self.spec_cnn(wav)  # [B]
 
         # Cross-backbone fusion
-        # Pool XLS-R features for fusion
-        xlsr_pooled = torch.cat([h.mean(dim=1) for h in hs2], dim=-1)
-        xlsr_proj = self.lw_classifier.bottleneck(xlsr_pooled.mean(dim=0, keepdim=True).expand(pooled1.size(0), -1))
-        cross_input = torch.cat([pooled1, xlsr_proj], dim=-1)
+        xlsr_proj = self.lw_classifier_xlsr.bottleneck(
+            torch.cat([h.mean(dim=1) for h in hs2], dim=-1).mean(dim=0, keepdim=True).expand(pooled1.size(0), -1)
+        )
+        wavlm_proj = self.lw_classifier_wavlm.bottleneck(
+            torch.cat([h.mean(dim=1) for h in hs3], dim=-1).mean(dim=0, keepdim=True).expand(pooled1.size(0), -1)
+        )
+        # CNN features (reuse spec_cnn's last layer before head)
+        with torch.no_grad():
+            mel = self.spec_cnn._wav_to_mel(wav)
+            cnn_feat = self.spec_cnn.cnn(mel).flatten(1)  # [B, 128]
+
+        cross_input = torch.cat([pooled1, xlsr_proj, wavlm_proj, cnn_feat], dim=-1)
         cross_score = self.cross_fusion(cross_input).squeeze(-1)
 
         # Weighted combination
-        alpha1 = torch.sigmoid(self.alpha_mhubert)
-        alpha2 = torch.sigmoid(self.alpha_xlsr)
-        total = alpha1 + alpha2 + 1e-8
-        alpha1, alpha2 = alpha1 / total, alpha2 / total
+        alphas = torch.softmax(torch.stack([
+            self.alpha_mhubert, self.alpha_xlsr, self.alpha_wavlm, self.alpha_spec
+        ]), dim=0)
 
-        final = alpha1 * mhubert_score + alpha2 * xlsr_score + (1 - alpha1 - alpha2) * cross_score
+        final = (alphas[0] * mhubert_score +
+                 alphas[1] * xlsr_score +
+                 alphas[2] * wavlm_score +
+                 alphas[3] * spec_score +
+                 (1 - alphas.sum()) * cross_score)
 
         return final
 
@@ -459,7 +550,7 @@ class UltimateDetector(nn.Module):
         for i in range(0, len(hs1) - 1, 2):
             h1, h2 = hs1[i], hs1[i + 1]
             g = self.pair_gates[i // 2].gate(torch.cat([h1, h2], dim=-1))
-            gate_dists.append(g.mean(dim=(1, 2)))  # [B]
+            gate_dists.append(g.mean(dim=(1, 2)))
         return gate_dists
 
 
