@@ -168,7 +168,11 @@ def prepare_codecfake(out_dir, max_samples=3000):
 # 3. SONICS — 노래/음악 fake (Suno/Udio)
 # ============================================================
 def prepare_sonics(out_dir, max_samples=5000):
-    """SONICS HF에서 오디오 다운로드."""
+    """SONICS HF에서 오디오 다운로드.
+    
+    Note: awsaf49/sonics는 메타데이터만 있는 경우가 많음.
+    audio 컬럼이 없으면 youtube_id로 다운로드 시도.
+    """
     try:
         from datasets import load_dataset
         ds = load_dataset("awsaf49/sonics", split="train", streaming=True)
@@ -177,11 +181,59 @@ def prepare_sonics(out_dir, max_samples=5000):
         rows = []
         count = 0
         
-        # First, check what columns exist
         sample = next(iter(ds))
-        print(f"  SONICS columns: {list(sample.keys())}")
+        cols = list(sample.keys())
+        print(f"  SONICS columns: {cols}")
         
-        # Reset and iterate
+        has_audio = "audio" in cols
+        
+        if not has_audio:
+            # Try to download audio using yt-dlp from youtube_id
+            print("  SONICS: No audio column, trying yt-dlp download...")
+            ds = load_dataset("awsaf49/sonics", split="train", streaming=True)
+            
+            try:
+                import subprocess, tempfile
+                for i, s in enumerate(ds):
+                    if count >= max_samples:
+                        break
+                    ytid = s.get("youtube_id") or s.get("id")
+                    if not ytid:
+                        continue
+                    wav_path = out_dir / f"sonics_fake_{count:06d}.wav"
+                    if wav_path.exists():
+                        rows.append((str(wav_path), 1, "sonics"))
+                        count += 1
+                        continue
+                    try:
+                        url = f"https://www.youtube.com/watch?v={ytid}"
+                        with tempfile.TemporaryDirectory() as td:
+                            out_file = os.path.join(td, "audio")
+                            r = subprocess.run(
+                                ["yt-dlp", "-x", "--audio-format", "wav",
+                                 "--max-filesize", "10M",
+                                 "-o", out_file + ".%(ext)s", url],
+                                capture_output=True, timeout=30
+                            )
+                            # Find the output wav
+                            for f in os.listdir(td):
+                                if f.endswith(".wav"):
+                                    shutil.copy2(os.path.join(td, f), str(wav_path))
+                                    rows.append((str(wav_path), 1, "sonics"))
+                                    count += 1
+                                    break
+                    except Exception:
+                        continue
+                    if count % 100 == 0 and count > 0:
+                        print(f"  SONICS yt-dlp: {count} files...")
+            except Exception as e2:
+                print(f"  SONICS yt-dlp failed: {e2}")
+            
+            if count == 0:
+                print("  SONICS: skipping (no audio available)")
+            return rows
+        
+        # Has audio column - direct download
         ds = load_dataset("awsaf49/sonics", split="train", streaming=True)
         for i, sample in enumerate(ds):
             if count >= max_samples:
@@ -222,6 +274,10 @@ def prepare_librispeech_real(out_dir, cache_dir=Path("_cache/librispeech"), max_
         return []
     
     flacs = sorted(root.rglob("*.flac"))
+    if len(flacs) == 0:
+        print(f"LibriSpeech: no .flac files found at {root}")
+        return []
+    
     rng = np.random.default_rng(42)
     sel = rng.choice(len(flacs), size=min(max_samples, len(flacs)), replace=False)
     
@@ -234,6 +290,83 @@ def prepare_librispeech_real(out_dir, cache_dir=Path("_cache/librispeech"), max_
             x = load_wav(src)
             save_wav(x[:int(10 * SR)], wav_path)  # 최대 10초
         rows.append((str(wav_path), 0, "librispeech"))
+    
+    return rows
+
+
+def prepare_edge_tts_real(out_dir, max_samples=2000):
+    """edge-tts로 실제 음성 데이터 생성 (fallback)."""
+    try:
+        import edge_tts
+        import asyncio
+    except ImportError:
+        print("  edge-tts not installed")
+        return []
+    
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Various English voices for diversity
+    voices = [
+        "en-US-AriaNeural", "en-US-GuyNeural", "en-US-JennyNeural",
+        "en-US-AndrewNeural", "en-US-EmmaNeural", "en-US-BrianNeural",
+        "en-GB-SoniaNeural", "en-GB-RyanNeural", "en-AU-NatashaNeural",
+        "en-IN-PrabhatNeural",
+    ]
+    
+    # Short sentences for voice samples
+    sentences = [
+        "The quick brown fox jumps over the lazy dog.",
+        "A stitch in time saves nine.",
+        "Practice makes perfect.",
+        "The early bird catches the worm.",
+        "Actions speak louder than words.",
+        "Knowledge is power.",
+        "Time flies when you are having fun.",
+        "All that glitters is not gold.",
+        "Where there is a will, there is a way.",
+        "The pen is mightier than the sword.",
+        "Rome was not built in a day.",
+        "Better late than never.",
+        "The grass is always greener on the other side.",
+        "Do not put all your eggs in one basket.",
+        "Every cloud has a silver lining.",
+    ]
+    
+    rows = []
+    count = 0
+    
+    async def generate_one(text, voice, path):
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(str(path))
+    
+    for vi, voice in enumerate(voices):
+        if count >= max_samples:
+            break
+        for si, sent in enumerate(sentences):
+            if count >= max_samples:
+                break
+            wav_path = out_dir / f"tts_real_{count:06d}.wav"
+            mp3_path = out_dir / f"tts_real_{count:06d}.mp3"
+            if wav_path.exists():
+                rows.append((str(wav_path), 0, "edge_tts"))
+                count += 1
+                continue
+            try:
+                asyncio.run(generate_one(sent, voice, mp3_path))
+                # Convert mp3 to wav
+                import subprocess
+                subprocess.run(["ffmpeg", "-y", "-i", str(mp3_path),
+                              "-ar", str(SR), "-ac", "1", str(wav_path)],
+                             capture_output=True, timeout=10)
+                mp3_path.unlink(missing_ok=True)
+                if wav_path.exists():
+                    rows.append((str(wav_path), 0, "edge_tts"))
+                    count += 1
+            except Exception:
+                mp3_path.unlink(missing_ok=True)
+                continue
+            if count % 200 == 0 and count > 0:
+                print(f"  edge-tts: {count} files...")
     
     return rows
 
@@ -357,6 +490,13 @@ def main():
     vr = []
     vr += prepare_librispeech_real(voice_real_dir, max_samples=args.max_voice_real)
     print(f"  LibriSpeech real: {len(vr)} files")
+    
+    # Fallback: if no LibriSpeech, use edge-tts to generate real voice
+    if len(vr) == 0 and args.auto_download:
+        print("  LibriSpeech not available, using edge-tts fallback...")
+        vr += prepare_edge_tts_real(voice_real_dir, max_samples=args.max_voice_real)
+        print(f"  edge-tts real: {len(vr)} files")
+    
     write_manifest(vr, out / "manifest_voice_real.csv")
     
     # ---- Voice fake ----
@@ -392,22 +532,32 @@ def main():
     
     # ---- 통합 manifest ----
     all_rows = []
-    for rows in [vr, vf, mr, mf]:
-        for filepath, label, source in rows:
+    for rows_list in [vr, vf, mr, mf]:
+        for filepath, label, source in rows_list:
             all_rows.append([filepath, label, source])
     
     write_manifest(all_rows, out / "manifest_all.csv")
     
-    # 통합 manifest에서 train/val 분리 (source 단위 stratified)
+    # 통합 manifest에서 train/val 분리
     if len(all_rows) == 0:
         print("\nERROR: No training data found! Check your data sources.")
-        print("Required: LibriSpeech, ASVspoof, Codecfake, SONICS, etc.")
+        print("Required: LibriSpeech, ASVspoof, Codecfake, edge-tts, etc.")
         return
     
     from sklearn.model_selection import train_test_split
     all_for_split = [[r[0], r[1]] for r in all_rows]
-    tr, va = train_test_split(all_for_split, test_size=0.15, random_state=42,
-                               stratify=[r[1] for r in all_for_split])
+    
+    # Check if we have both classes for stratified split
+    labels = [r[1] for r in all_for_split]
+    has_both = 0 in labels and 1 in labels
+    
+    if has_both and len(all_for_split) >= 4:
+        tr, va = train_test_split(all_for_split, test_size=0.15, random_state=42,
+                                   stratify=labels)
+    else:
+        # Can't stratify with single class or too few samples
+        tr, va = train_test_split(all_for_split, test_size=0.15, random_state=42)
+    
     write_manifest([[r[0], r[1], ""] for r in tr], out / "manifest_train.csv")
     write_manifest([[r[0], r[1], ""] for r in va], out / "manifest_val.csv")
     
