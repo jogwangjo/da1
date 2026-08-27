@@ -575,12 +575,26 @@ class RAPTORScorer:
     def _load_model(self):
         if not self.ckpt.exists():
             return None
-        # Import RAPTOR from training code
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-        from train_raptor import RAPTOR
-        ck = torch.load(self.ckpt, map_location=self.device)
-        model = RAPTOR(ck.get("backbone", "utter-project/mHuBERT-147"))
-        model.load_state_dict(ck["model"])
+
+        ck = torch.load(self.ckpt, map_location=self.device, weights_only=False)
+
+        # Try UltimateDetector (v2) first, then fall back to RAPTOR (v1)
+        try:
+            from train_raptor_v2 import UltimateDetector
+            model = UltimateDetector(dropout=0.1)
+            model.load_state_dict(ck["model"])
+            print("  Loaded UltimateDetector (dual-backbone)")
+        except Exception:
+            try:
+                from train_raptor import RAPTOR
+                model = RAPTOR(ck.get("backbone", "utter-project/mHuBERT-147"))
+                model.load_state_dict(ck["model"])
+                print("  Loaded RAPTOR (single-backbone)")
+            except Exception as e:
+                print(f"  Failed to load model: {e}")
+                return None
+
         model = model.to(self.device).eval()
         return model
 
