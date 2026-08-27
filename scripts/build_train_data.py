@@ -25,6 +25,7 @@ import csv
 import os
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -58,76 +59,136 @@ def trim_or_pad(x, dur_sec, rng=None):
 
 
 # ============================================================
-# 1. ASVspoof 2019 LA — 음성 fake 학습의 핵심
+# 1. ASVspoof 2019 LA — 음성 fake 학습의 핵심 (자동 다운로드)
 # ============================================================
+
+def download_asvspoof_2019(out_dir):
+    """ASVspoof 2019 LA 자동 다운로드 (Edinburgh DataShare)."""
+    out_dir = Path(out_dir)
+    flac_dir = out_dir / "flac"
+    if flac_dir.exists() and len(list(flac_dir.glob("*.flac"))) > 1000:
+        print(f"  ASVspoof 2019 already exists at {out_dir}")
+        return True
+
+    print("  Downloading ASVspoof 2019 LA...")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 공개 다운로드 URL (Edinburgh DataShare)
+    urls = {
+        "train_flac": "https://datashare.ed.ac.uk/bitstream/handle/10283/3443/LA_trn.flac.zip",
+        "train_dev": "https://datashare.ed.ac.uk/bitstream/handle/10283/3443/LA_dev_metadata.txt",
+        "train_label": "https://datashare.ed.ac.uk/bitstream/handle/10283/3443/LA_cm/train/trial_metadata.txt",
+    }
+
+    try:
+        # Try downloading train flac (main data)
+        zip_path = out_dir / "LA_trn.flac.zip"
+        if not zip_path.exists() and not flac_dir.exists():
+            print("  Downloading ASVspoof 2019 LA train flac (~2.5GB)...")
+            subprocess.run([
+                "wget", "-q", "--show-progress", "-O", str(zip_path),
+                urls["train_flac"]
+            ], timeout=600)
+
+        # Extract
+        if zip_path.exists() and not flac_dir.exists():
+            print("  Extracting...")
+            subprocess.run([
+                "unzip", "-q", "-o", str(zip_path), "-d", str(out_dir)
+            ], timeout=300)
+            # Clean up zip to save space
+            zip_path.unlink(missing_ok=True)
+
+        # Download label file
+        label_path = out_dir / "cm" / "train" / "trial_metadata.txt"
+        if not label_path.exists():
+            label_dir = out_dir / "cm" / "train"
+            label_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run([
+                "wget", "-q", "-O", str(label_path),
+                urls["train_label"]
+            ], timeout=60)
+
+        return flac_dir.exists() and len(list(flac_dir.glob("*.flac"))) > 0
+
+    except Exception as e:
+        print(f"  ASVspoof download failed: {e}")
+        return False
+
+
 def prepare_asvspoof_2019_la(asvspoof_dir, out_dir, max_per_class=5000):
-    """ASVspoof 2019 LA train/dev → manifest."""
+    """ASVspoof 2019 LA train → manifest."""
     asvspoof_dir = Path(asvspoof_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     rows = []
-    
-    # flac 디렉토리
+
+    # Label file path
+    label_path = None
+    for candidate in [
+        asvspoof_dir / "cm" / "train" / "trial_metadata.txt",
+        asvspoof_dir / "LA_cm" / "train" / "trial_metadata.txt",
+    ]:
+        if candidate.exists():
+            label_path = candidate
+            break
+
+    # Fallback: search for any txt with bonafide/spoof
+    if label_path is None:
+        for lf in asvspoof_dir.rglob("*.txt"):
+            try:
+                content = lf.read_text()[:2000]
+                if "bonafide" in content or "spoof" in content:
+                    label_path = lf
+                    break
+            except Exception:
+                continue
+
     flac_dir = asvspoof_dir / "flac"
     if not flac_dir.exists():
-        # zip 파일이 있으면 풀기
-        for ext in ["zip", "tar.gz", "tgz"]:
-            cand = asvspoof_dir / f"ASVspoof2019_LA_{ext}"
-            if cand.exists():
-                print(f"extracting {cand} ...")
-                if ext == "zip":
-                    with zipfile.ZipFile(cand) as zf:
-                        zf.extractall(asvspoof_dir)
-                else:
-                    subprocess.run(["tar", "xzf", str(cand)], cwd=asvspoof_dir, check=True)
+        # Try parent dirs
+        for p in asvspoof_dir.rglob("flac"):
+            if p.is_dir() and len(list(p.glob("*.flac"))) > 100:
+                flac_dir = p
                 break
-    
-    # label 파일 파싱
-    label_files = list(asvspoof_dir.rglob("*.txt"))
-    label_file = None
-    for lf in label_files:
-        content = lf.read_text()
-        if "bonafide" in content or "spoof" in content:
-            label_file = lf
-            break
-    
-    if label_file is None:
-        print(f"WARNING: label file not found in {asvspoof_dir}, using flac listing")
-        flacs = sorted(flac_dir.glob("*.flac")) if flac_dir.exists() else []
-        real_count, fake_count = 0, 0
-        for f in flacs:
-            # 파일명 규칙: LA_D_XXX_YYYY.flac → D=DEV, T=TRAIN
-            parts = f.stem.split("_")
-            if len(parts) >= 3 and parts[1] == "T":  # train partition
-                if real_count < max_per_class:
-                    rows.append((str(f), 0, "asvspoof19_train_real"))
-                    real_count += 1
-                elif fake_count < max_per_class * 2:
-                    rows.append((str(f), 1, "asvspoof19_train_fake"))
-                    fake_count += 1
+
+    if not flac_dir.exists() or not label_path:
+        print(f"  WARNING: ASVspoof structure not found in {asvspoof_dir}")
+        # Fallback: use whatever flac files exist
+        if flac_dir.exists():
+            flacs = sorted(flac_dir.glob("*.flac"))
+            for i, f in enumerate(flacs[:max_per_class * 2]):
+                label = 1 if i >= max_per_class else 0
+                rows.append((str(f), label, "asvspoof19"))
         return rows
-    
-    # label 파싱: utterance_label bonafide/spoof
+
+    # Parse label file
     real_count, fake_count = 0, 0
-    with open(label_file) as f:
+    with open(label_path) as f:
         for line in f:
             parts = line.strip().split()
             if len(parts) < 2:
                 continue
-            utt_id, label = parts[0], parts[1]
-            # flac 파일 경로
+            utt_id, label_str = parts[0], parts[1]
+            is_fake = 1 if label_str == "spoof" else 0
+
+            # Find flac file
             flac_path = flac_dir / f"{utt_id}.flac"
             if not flac_path.exists():
-                continue
-            
-            is_fake = 1 if label == "spoof" else 0
+                # Try subdirectory structure
+                for p in flac_dir.rglob(f"{utt_id}.flac"):
+                    flac_path = p
+                    break
+                else:
+                    continue
+
             if is_fake == 0 and real_count < max_per_class:
                 rows.append((str(flac_path), 0, "asvspoof19"))
                 real_count += 1
             elif is_fake == 1 and fake_count < max_per_class * 2:
                 rows.append((str(flac_path), 1, "asvspoof19"))
                 fake_count += 1
-    
+
     return rows
 
 
@@ -140,7 +201,7 @@ def prepare_codecfake(out_dir, max_samples=3000):
         out_dir.mkdir(parents=True, exist_ok=True)
         from datasets import load_dataset
         ds = load_dataset("rogertseng/CodecFake", split="train", streaming=True, revision="refs/convert/parquet")
-        
+
         rows = []
         for i, sample in enumerate(ds):
             if i >= max_samples:
@@ -157,10 +218,48 @@ def prepare_codecfake(out_dir, max_samples=3000):
                     )
                 sf.write(str(wav_path), np.clip(audio_array, -1, 1), SR)
             rows.append((str(wav_path), 1, "codecfake"))
-        
+
         return rows
     except Exception as e:
         print(f"Codecfake download failed: {e}")
+        return []
+
+
+# ============================================================
+# 2b. Diverse TTS Fakes — 여러 TTS 엔진으로 생성
+# ============================================================
+def prepare_diverse_tts_fakes(out_dir, max_samples=3000):
+    """generate_diverse_fakes.py 호출해서 다양한 TTS fake 생성."""
+    try:
+        script = Path(__file__).parent / "generate_diverse_fakes.py"
+        if not script.exists():
+            print(f"  generate_diverse_fakes.py not found")
+            return []
+
+        tts_dir = out_dir / "tts_fakes"
+        tts_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check existing
+        existing = len(list(tts_dir.glob("tts_fake_*.wav")))
+        if existing >= max_samples:
+            print(f"  Diverse TTS: {existing} files already exist")
+        else:
+            print(f"  Generating {max_samples} diverse TTS fakes...")
+            subprocess.run([
+                sys.executable, str(script),
+                "--out", str(tts_dir),
+                "--max", str(max_samples),
+                "--augment",
+            ], timeout=3600)
+
+        rows = []
+        for wav in sorted(tts_dir.glob("tts_fake_*.wav")):
+            rows.append((str(wav), 1, "diverse_tts"))
+
+        return rows[:max_samples]
+
+    except Exception as e:
+        print(f"  Diverse TTS generation failed: {e}")
         return []
 
 
@@ -502,15 +601,37 @@ def main():
     # ---- Voice fake ----
     print("\n[2/4] Voice fake data ...")
     vf = []
-    if args.asvspoof_dir:
-        vf += prepare_asvspoof_2019_la(args.asvspoof_dir, voice_fake_dir, args.max_voice_fake)
-        print(f"  ASVspoof 2019 LA: {len([r for r in vf if 'asvspoof' in r[2]])} files")
-    
+
+    # ASVspoof 2019 LA (핵심!) — 자동 다운로드
     if args.auto_download:
-        cf = prepare_codecfake(voice_fake_dir, max_samples=min(2000, args.max_voice_fake - len(vf)))
-        vf += cf
-        print(f"  Codecfake: {len(cf)} files")
-    
+        asvspoof_cache = Path("_cache/asvspoof2019")
+        if download_asvspoof_2019(asvspoof_cache):
+            asv_rows = prepare_asvspoof_2019_la(asvspoof_cache, voice_fake_dir, args.max_voice_fake)
+            vf += asv_rows
+            print(f"  ASVspoof 2019 LA: {len(asv_rows)} files")
+        else:
+            print("  ASVspoof 2019 LA: download failed, skipping")
+    elif args.asvspoof_dir:
+        asv_rows = prepare_asvspoof_2019_la(args.asvspoof_dir, voice_fake_dir, args.max_voice_fake)
+        vf += asv_rows
+        print(f"  ASVspoof 2019 LA: {len(asv_rows)} files")
+
+    # Codecfake
+    if args.auto_download:
+        remaining = args.max_voice_fake - len(vf)
+        if remaining > 0:
+            cf = prepare_codecfake(voice_fake_dir, max_samples=min(2000, remaining))
+            vf += cf
+            print(f"  Codecfake: {len(cf)} files")
+
+    # Diverse TTS fakes (edge-tts로 다양한 화자/텍스트)
+    if args.auto_download:
+        remaining = args.max_voice_fake - len(vf)
+        if remaining > 0:
+            tts = prepare_diverse_tts_fakes(voice_fake_dir, max_samples=min(3000, remaining))
+            vf += tts
+            print(f"  Diverse TTS: {len(tts)} files")
+
     write_manifest(vf, out / "manifest_voice_fake.csv")
     
     # ---- Music real ----
@@ -529,7 +650,44 @@ def main():
         mf += prepare_sonics(music_fake_dir, max_samples=args.max_music_fake)
         print(f"  SONICS: {len(mf)} files")
     write_manifest(mf, out / "manifest_music_fake.csv")
-    
+
+    # ---- Data Augmentation (증강으로 데이터 다양화) ----
+    print("\n[5/5] Data augmentation...")
+    aug_dir = out / "augmented"
+    aug_dir.mkdir(parents=True, exist_ok=True)
+
+    # Voice augmented copies
+    for src_dir, label, name in [
+        (voice_real_dir, 0, "voice_real"),
+        (voice_fake_dir, 1, "voice_fake"),
+    ]:
+        src_wavs = sorted(src_dir.glob("*.wav"))
+        if len(src_wavs) == 0:
+            continue
+        aug_out = aug_dir / name
+        aug_out.mkdir(parents=True, exist_ok=True)
+        existing = len(list(aug_out.glob("*.wav")))
+        if existing < len(src_wavs) * 2:
+            print(f"  Augmenting {name} ({len(src_wavs)} files)...")
+            try:
+                subprocess.run([
+                    sys.executable, str(Path(__file__).parent / "augment_data.py"),
+                    "--input", str(src_dir),
+                    "--output", str(aug_out),
+                    "--n-copies", "2",
+                ], timeout=3600)
+            except Exception as e:
+                print(f"  Augmentation failed: {e}")
+
+        # Add augmented files to rows
+        for wav in sorted(aug_out.glob("*.wav")):
+            if label == 0:
+                vr.append((str(wav), 0, f"aug_{name}"))
+            else:
+                vf.append((str(wav), 1, f"aug_{name}"))
+
+    print(f"  After augmentation: Voice real={len(vr)}, Voice fake={len(vf)}")
+
     # ---- 통합 manifest ----
     all_rows = []
     for rows_list in [vr, vf, mr, mf]:

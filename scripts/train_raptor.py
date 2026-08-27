@@ -142,6 +142,58 @@ def apply_rawboost(x, rng, p=0.5):
 
 
 # ============================================================
+# Mixup Augmentation
+# ============================================================
+
+def mixup_data(x, y, alpha=0.2, rng=None):
+    """Mixup: 두 샘플을 혼합해서 새로운 샘플 생성."""
+    if rng is None:
+        rng = np.random.default_rng()
+    lam = float(rng.beta(alpha, alpha))
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Mixup 손실 계산."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+# ============================================================
+# SpecAugment
+# ============================================================
+
+def specaugment(x, rng=None):
+    """SpecAugment: 주파수/시간 마스킹."""
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Convert to fake spectrogram-like representation
+    # x: [T] waveform → reshape for masking
+    T = len(x)
+
+    # Time masking (연속된 시간 영역 마스킹)
+    if rng.random() < 0.5:
+        mask_len = int(rng.integers(T // 10, T // 4))
+        mask_start = int(rng.integers(0, T - mask_len))
+        x = x.copy()
+        x[mask_start:mask_start + mask_len] = 0
+
+    # Frequency-like masking (주기적 패턴 마스킹)
+    if rng.random() < 0.3:
+        freq = int(rng.integers(50, 200))
+        x = x.copy()
+        mask = np.ones(len(x), dtype=np.float32)
+        mask[::freq] = 0  # 주기적 제거
+        x = x * mask
+
+    return x.astype(np.float32)
+
+
+# ============================================================
 # Dataset
 # ============================================================
 
@@ -486,6 +538,8 @@ def main():
         if start_epoch == 1:
             lg.writerow(["epoch", "loss", "val_eer", "time"])
         
+        rng_train = np.random.default_rng(42)
+
         for ep in range(start_epoch, args.epochs + 1):
             t0 = time.time()
             model.train()
@@ -493,7 +547,21 @@ def main():
             
             for wav, y in dl_tr:
                 wav, y = wav.to(device), y.to(device).squeeze(-1)
-                
+
+                # SpecAugment (50% 확률)
+                if rng_train.random() < 0.5:
+                    wav_np = wav.cpu().numpy()
+                    for i in range(len(wav_np)):
+                        wav_np[i] = specaugment(wav_np[i], rng=rng_train)
+                    wav = torch.from_numpy(wav_np).to(device)
+
+                # Mixup (50% 확률, epoch 5부터)
+                use_mixup = ep >= 5 and rng_train.random() < 0.5
+                if use_mixup:
+                    wav_mixed, y_a, y_b, lam = mixup_data(wav, y, alpha=0.2, rng=rng_train)
+                else:
+                    wav_mixed = wav
+
                 # RawBoost augmentation view for consistency
                 rng_cons = np.random.default_rng(int(time.time() * 1000) % (2**31))
                 wav_aug = wav.clone()
@@ -501,26 +569,31 @@ def main():
                     wav_aug[i] = torch.from_numpy(
                         apply_rawboost(wav_aug[i].cpu().numpy(), rng_cons, p=1.0)
                     ).to(device)
-                
+
                 opt.zero_grad(set_to_none=True)
                 with torch.autocast("cuda", enabled=(device == "cuda")):
-                    logits = model(wav)
-                    
+                    logits = model(wav_mixed)
+
                     # Classification loss with label smoothing
-                    targets = y * (1 - args.label_smoothing) + 0.5 * args.label_smoothing
-                    loss_cls = bce(logits.float(), targets)
-                    
+                    if use_mixup:
+                        targets_a = y_a * (1 - args.label_smoothing) + 0.5 * args.label_smoothing
+                        targets_b = y_b * (1 - args.label_smoothing) + 0.5 * args.label_smoothing
+                        loss_cls = mixup_criterion(bce, logits.float(), targets_a, targets_b, lam)
+                    else:
+                        targets = y * (1 - args.label_smoothing) + 0.5 * args.label_smoothing
+                        loss_cls = bce(logits.float(), targets)
+
                     # Consistency loss
                     loss_cons = consistency_loss(model, wav, wav_aug, args.consistency_w)
-                    
+
                     loss = loss_cls + loss_cons
-                
+
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(opt)
                 scaler.update()
-                
+
                 tot += loss.item()
                 nb += 1
             

@@ -81,14 +81,14 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 }
 
 # Ensemble weights (tuned on pseudo-eval)
-W_DF_VOICE = 0.4       # DF-Arena in voice ensemble
-W_DF_MUSIC = 0.3       # DF-Arena in music ensemble
-W_AASIST = 0.3          # AASIST in voice ensemble
-W_SONICS = 0.5          # SONICS in music ensemble
-W_RAPTOR = 0.3          # RAPTOR in ensemble (if available)
+W_DF_VOICE = 0.35      # DF-Arena in voice ensemble
+W_DF_MUSIC = 0.25      # DF-Arena in music ensemble
+W_AASIST = 0.25         # AASIST in voice ensemble
+W_SONICS = 0.45         # SONICS in music ensemble
+W_RAPTOR = 0.35         # RAPTOR in ensemble (if available)
 
 # TTA settings
-TTA_N_AUGMENTS = 2  # 0=off, 1=+voip, 2=+voip+noise, 3=+voip+noise+speed
+TTA_N_AUGMENTS = 4  # 0=off, 1=+voip, 2=+voip+noise, 3=+opus, 4=+phone, 5=+speed, 6=+pitch
 
 
 # ============================================================
@@ -180,7 +180,7 @@ def logit(p):
 
 
 # ============================================================
-# TTA (Test-Time Augmentation) — RAPTOR 논문 기반
+# TTA (Test-Time Augmentation) — 향상된 버전
 # ============================================================
 
 def voip_augment(audio):
@@ -204,6 +204,62 @@ def voip_augment(audio):
         return audio
 
 
+def opus_augment(audio):
+    """Opus 코덱 시뮬레이션 (WebRTC/VoIP).
+    
+    Opus is the standard codec for VoIP calls (Zoom, WhatsApp, etc.)
+    so this augmentation simulates real-world phone call distortion.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_in:
+            import soundfile as sf
+            sf.write(tmp_in.name, audio, AUDIO_SAMPLE_RATE)
+            tmp_out = tmp_in.name.replace('.wav', '_opus.ogg')
+            subprocess.run([
+                'ffmpeg', '-y', '-i', tmp_in.name,
+                '-codec:a', 'libopus', '-b:a', '24k',
+                '-ar', str(AUDIO_SAMPLE_RATE), tmp_out
+            ], capture_output=True, timeout=10)
+            augmented, _ = sf.read(tmp_out)
+            os.unlink(tmp_in.name)
+            if os.path.exists(tmp_out):
+                os.unlink(tmp_out)
+        return augmented.astype(np.float32)[:len(audio)]
+    except Exception:
+        return audio
+
+
+def phone_call_augment(audio):
+    """전화선 시뮬레이션: 8kHz 다운샘플 + 밴드패스 + 노이즈."""
+    try:
+        import librosa
+        from scipy.signal import butter, sosfilt
+
+        # Downsample to 8kHz
+        audio_8k = librosa.resample(
+            audio.astype(np.float64), orig_sr=AUDIO_SAMPLE_RATE, target_sr=8000
+        )
+
+        # Bandpass filter (300-3400 Hz, telephone frequency band)
+        sos = butter(4, [300, 3400], btype='band', fs=8000, output='sos')
+        audio_8k = sosfilt(sos, audio_8k).astype(np.float32)
+
+        # Add telephone line noise
+        noise = np.random.normal(0, 0.005, len(audio_8k)).astype(np.float32)
+        audio_8k = audio_8k + noise
+
+        # Back to 16kHz
+        audio_out = librosa.resample(
+            audio_8k.astype(np.float64), orig_sr=8000, target_sr=AUDIO_SAMPLE_RATE
+        )
+
+        if len(audio_out) < len(audio):
+            audio_out = np.pad(audio_out, (0, len(audio) - len(audio_out)))
+        return audio_out[:len(audio)].astype(np.float32)
+    except Exception:
+        return audio
+
+
 def noise_augment(audio, snr_db=20):
     """백색 노이즈 첨가."""
     ps = np.mean(audio.astype(np.float64)**2) + 1e-10
@@ -211,13 +267,56 @@ def noise_augment(audio, snr_db=20):
     return (audio + np.random.normal(0, np.sqrt(pn), len(audio))).astype(np.float32)
 
 
+def speed_augment(audio, rate=1.05):
+    """Speed perturbation."""
+    try:
+        import librosa
+        augmented = librosa.resample(
+            audio.astype(np.float64), orig_sr=AUDIO_SAMPLE_RATE,
+            target_sr=int(AUDIO_SAMPLE_RATE / rate)
+        )
+        if len(augmented) < len(audio):
+            augmented = np.pad(augmented, (0, len(audio) - len(augmented)))
+        return augmented[:len(audio)].astype(np.float32)
+    except Exception:
+        return audio
+
+
+def pitch_augment(audio, n_steps=1.0):
+    """Pitch shift."""
+    try:
+        import librosa
+        return librosa.effects.pitch_shift(
+            audio.astype(np.float64), sr=AUDIO_SAMPLE_RATE, n_steps=n_steps
+        ).astype(np.float32)
+    except Exception:
+        return audio
+
+
 def tta_views(audio, n_augments=2):
-    """TTA 뷰 생성: 원본 + n_augments 증강."""
+    """TTA 뷰 생성: 원본 + n_augments 증강.
+    
+    Various augmentations simulate real-world conditions:
+    - voip: MP3 codec (common in audio sharing)
+    - opus: Opus codec (VoIP/Zoom/WhatsApp)
+    - phone: 8kHz telephone line
+    - noise: background noise
+    - speed: speed variation
+    - pitch: pitch shift
+    """
     views = [audio]
     if n_augments >= 1:
         views.append(voip_augment(audio))
     if n_augments >= 2:
         views.append(noise_augment(audio))
+    if n_augments >= 3:
+        views.append(opus_augment(audio))
+    if n_augments >= 4:
+        views.append(phone_call_augment(audio))
+    if n_augments >= 5:
+        views.append(speed_augment(audio, 1.05))
+    if n_augments >= 6:
+        views.append(pitch_augment(audio, 1.0))
     return views[:n_augments + 1]
 
 
